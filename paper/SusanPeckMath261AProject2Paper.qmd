@@ -1,8 +1,7 @@
 ---
-title: "BMI"
-subtitle: "Is BMI a good predictor of health?"
+title: "Is BMI Alone a Good Predictor of Systolic Blood Pressure? "
 author: "Susan Peck"
-thanks: "Project repository available at: https://github.com/susanpeck/MATH261A-project-1-Linear-Regression"
+thanks: "Project repository available at: https://github.com/susanpeck/MATH261A-project-2-multiple-regression"
 date: today
 date-format: long
 format: pdf
@@ -18,160 +17,174 @@ editor:
 #| warning: false
 #| message: false
 
+# Load necessary libraries
 library(ggplot2)
 library(tidyverse)
+library(tidymodels)
 library(dplyr)
+library(haven)
+library(tidyr)
+library(MASS)
 
-water_raw_data <- data.frame(read.csv("../data/SAFER_RA.csv"))
+# Read in the 2017-2018 NHANES survey data, published in 2020
+demo_data_raw <- read_xpt("../data/DEMO_J.xpt")  # Demographics (age, gender, etc.)
+bmx_data_raw <- read_xpt("../data/BMX_J.xpt")    # Body measures (height, weight, BMI, waist)
+bpx_data_raw <- read_xpt("../data/BPX_J.xpt")    # Blood pressure
+smq_data_raw <- read_xpt("../data/SMQ_J.xpt")    # Smoking questionnaire
+
+# Select age and gender variables
+# Change the Female value to a zero, and the Male value to a 1
+demo_data <- demo_data_raw %>%
+  dplyr::select(SEQN, RIAGENDR, RIDAGEYR) %>%
+  mutate(RIAGENDR = ifelse(RIAGENDR == 2, 0, 1))
+
+# Calculate the average systolic blood pressure reading and store the value
+# Must have more than one reading, so average at least two readings
+# If only one reading, or all four readings are zero, should return NA
+# Filter by the comment code that indicates there was difficulty with the measurement
+bpx_data <- bpx_data_raw %>%
+  filter(is.na(PEASCCT1) | PEASCCT1 == "") %>%
+  rowwise() %>%
+  mutate(
+    avg_systolic = ifelse(
+      sum(!is.na(c(BPXSY1, BPXSY2, BPXSY3, BPXSY4))) >= 2,
+      mean(c(BPXSY1, BPXSY2, BPXSY3, BPXSY4), na.rm = TRUE),
+      NA
+    )
+  ) %>%
+  ungroup() %>%
+  dplyr::select(SEQN, avg_systolic)
+
+# Select height, weight, BMI, and waist measurement variables
+# Filter by the comment code that indicates there was difficulty with the measurement
+bmx_data <- bmx_data_raw %>%
+  filter(
+    (is.na(BMIHT) | BMIHT == "") &      # Height comment
+    (is.na(BMIWT) | BMIWT == "") &      # Weight comment  
+    (is.na(BMIWAIST) | BMIWAIST == "")  # Waist circumference comment
+  ) %>%
+  dplyr::select(SEQN, BMXHT, BMXWT, BMXBMI, BMXWAIST)
+
+# Select variable about currently smoking
+# SMQ020: Never smoked = 2
+# SMQ040: Do you now smoke cigarettes? 1 = Every day, 2 = Some days, 3 = Not at all
+# Change to 1 = Currently smokes (Every day or Some days), 0 = Does not smoke
+smq_data <- smq_data_raw %>%
+  mutate(
+    currently_smokes = case_when(
+      SMQ020 == 2 ~ 0,                     # Never smoked = not currently smoking
+      SMQ040 == 1 | SMQ040 == 2 ~ 1,      # Every day or Some days = smoker
+      SMQ040 == 3 ~ 0,                     # Currently non-smoker
+      TRUE ~ NA                      # Everything else = NA
+    )
+  ) %>%
+  dplyr::select(SEQN, currently_smokes)
+
+# Combine all datasets using the unique number for each patient to join
+# Using R and my new knowledge of joins from CS157A at SJSU
+# Keep only participants who are 18 and older
+nhanes_data_2017 <- demo_data %>%
+  filter(RIDAGEYR >= 18 & RIDAGEYR <= 79) %>%  # Filter for adults ages 18–79
+  left_join(bmx_data, by = "SEQN") %>%
+  left_join(bpx_data, by = "SEQN") %>%
+  left_join(smq_data, by = "SEQN")
+
+nhanes_filterNA <- nhanes_data_2017 %>% na.omit()
+
+write_xpt(nhanes_filterNA, "../data/nhanes_cleaned_2017.xpt")
 
 ```
 
 # Abstract {#sec-abstract}
 
-This paper looks at 
+This analysis evaluates whether body mass index (BMI) alone is an adequate predictor of systolic blood pressure (SBP) using data from the 2017–2018 National Health and Nutrition Examination Survey (NHANES). Several linear regression models were developed, including a simple model with BMI as the sole predictor, a model incorporating a quadratic BMI term, a robust regression using the Huber loss function, and a full multivariate model that included age, gender, height, weight, waist circumference, and smoking status. Results show that while BMI is statistically associated with systolic blood pressure, it explains only a small proportion of the overall variation. The full model substantially improves predictive accuracy, with age emerging as the strongest predictor and BMI becoming non-significant once other variables are included. Model comparisons using root mean squared error (RMSE) indicated that the full model performed best on both the validation and test datasets. These findings suggest that BMI should not be relied upon as a sole indicator of individual-level blood pressure risk and that multivariate approaches incorporating additional factors provide more meaningful predictive value.
 
 # Introduction {#sec-introduction}
 
-California drinking water is safe for 98% [@2024needsreport] of the
-population and meets California state drinking water standards that are
-more strict than federal regulations. This still leaves about 400
-failing water systems serving 870,000 people, 600 water systems serving
-1.6 million people that are at risk of failure, and more than 400 others
-serving another 1.6 million that are potentially at risk of failing
-[@waterfail]. Smaller communities and populations that are economically
-disadvantaged may be more at risk of having water with higher levels of
-contaminants, or they may not have the resources to address and fix
-problems with the water system.
+Body Mass Index (BMI) is a simple calculated metric based on dividing weight by height squared. Major public health organizations like the World Health Organization (WHO) [@who2000] and the Centers for Disease Control (CDC) [@nih_bmi_definition] use BMI threshold values to report general population level statistics of how many people are overweight, underweight, and obese. BMI is simple and standardized making it easy to calculate and compare between populations. BMI is also used to track population trends over time and general correlations in a population between BMI and disease levels. However, BMI is only so useful at the individual level. In clinical practice, BMI is sometimes used to deny or delay medical treatment like surgery until the patient has lost weight [@asm_bs_guidelines].
 
-In 2016 the California State Water Resource Board adopted a Human Right
-to Water Resolution that includes a statement that "every human being
-has the right to safe, clean, affordable, and accessible water adequate
-for human consumption, cooking and sanitary purposes." The goals of
-Human Right to Water are to provide safe drinking water, accessible
-drinking water, affordable drinking water, and/or maintaining a
-sustainable and resilient water system. In 2019 California established
-the Safe and Affordable Funding for Equity and Resilience (SAFER)
-Program with the goal of helping struggling water systems and to help
-provide affordable safe drinking water. In 2021 SAFER performed a Needs
-Assessment and provided recommendations to try to determine where and
-how funds should be used to have the most impact in improving failing or
-at risk water systems.
+BMI is used as a screening tool and is not a direct measure of body fat [@romero2008]. BMI cannot determine how much body fat or muscle a person has, or where the fat is located. A very muscular person could be classified as overweight or even obese based solely on their BMI value. Abdominal fat is probably a better indicator of risk of heart disease than overall weight [@waist_circumference_better; @ashwell2012]. In addition, BMI does not account for differences in health due to age or sex and should probably not be used as a sole diagnostic criterion [@romero2008; @tomiyama2019_bmi_problems].
 
-This paper will provide details and definitions for the data obtained
-from the Drinking Water Needs Assessment, the indicators that are used
-to calculate the Total Risk for a water system, and the indicators that
-are used to calculate the CalEnviroScreen Score in the Data @sec-data.
-It will describe the general simple linear regression model and define
-the variables used to analyze potential correlations in the Methods
-@sec-methods. A simple linear regression model will be fitted to the
-data and show a positive linear association between the CalEnviroScreen
-Score and the Total Risk Score in the Results @sec-results, along with
-analysis of the residuals. The Discussion @sec-discussion will talk
-
+This paper will look at systolic blood pressure (SBP) data from the National Health and Nutrition Examination Survey (NHANES) conducted by the CDC's National Center for Health Statistics (NCHS) [@nhanes_overview]. Using this data (see @sec-data) we will test whether BMI alone adequately predicts SBP, and whether multivariate models substantially improve prediction. The analysis will look at a simple linear regression for a single predictor BMI, a model that uses a log transform on the response variable, robust regression with a Huber loss function, a quadratic model, and a full model with seven predictors (see @sec-methods). The models will be evaluated individually and then compared using training, validation, and test data split from the sample and root mean squared error in the @sec-results section. Limitations of the data and analysis, as well as future directions are in @sec-discussion.
 
 # Data {#sec-data}
 
-This paper uses data from the 2024 Drinking Water Needs Assessment
-report [@2024needsreport] through the SAFER program and definitions from
-the original 2021 Drinking Water Needs Assessment report
-[@2021needsreport]. The data was gathered from water systems' annual
-reports, water quality testing results sent to the California Water
-Board, and Census data. This data set contains information from 3214
-different water systems in California, each with 140 variables with
-information about the water system. The Drinking Water Needs Assessment
-reports were prepared by the California State Water Resources Control
-Board within the California Environmental Protection Agency (CalEPA), in
-partnership with the UCLA Luskin Center for Innovation (UCLA).
+This analysis uses data from the 2017-2018 cycle of the National Health and Nutrition Examination Survey (NHANES), conducted by the CDC's National Center for Health Statistics (NCHS). NHANES is a national survey that assesses the health and nutritional status of adults and children in the United States through interviews, physical examinations, and laboratory tests. The analysis will use body mass index (BMI), age, gender, height, weight, waist circumference and smoking status as predictor variables for average systolic blood pressure. Listed below are details for how the data were collected.
 
-The report calculated a risk assessment value for each water system. The
-Risk Assessment Result is based off of a score for each of 19 risk
-indicators (see @fig-risk). A standardized score is a value between 0
-and 1. Weight values between 1 and 3 were applied to the individual risk
-indicators. This resulted in a sub-score value for each subcategory. A
-total weighted risk value, called Total Risk Score for this paper, was
-calculated using the four subcategories scores. The result was used to
-indicate if the water system was At-Risk, Not-At-Risk, or
-Potentially-At-Risk. Some systems were not evaluated and have a Not
-Assessed value.
+**Average Systolic Blood Pressure (avg_systolic):** For 2017–2018 NHANES, blood pressure was measured using an automatic oscillometric device. The person had their arm circumference measured to pick the correct blood pressure cuff size, then was seated quietly for 5 minutes. Three blood pressure readings were taken 60 seconds apart, and a fourth reading was taken if necessary [@nhanesBPmanual2018; @nhanesBPX2018]. It is recommended to average the readings [@pickering2005_hypertension] so this analysis requires a minimum of two valid readings.
 
-![Risk Indicator Categories](Risk_Indicators_2021.png){#fig-risk
-fig-align="center" width="475"}
+**Body Mass Index (BMXBMI):** BMI (kg/m²) was calculated as weight in kilograms divided by height in meters squared, rounded to one decimal place.
 
-All "At Risk" systems exceed a 'threshold of concern' (see
-@sec-thresholds for specific values) for at least four risk indicators.
+**Height (BMXHT):** Standing height was measured in centimeters to the nearest 0.1 cm. Participants stood without shoes with heels together.
 
-The Needs Assessment spent time trying to figure out a threshold for
-what would make water unaffordable to the residents of that water
-system. Affordability in this data set is based on three measured
-values: the percent of the MHI, a comparison to the state average water
-bill, and the number of shut-offs of water. ([@sec-thresholds])
+**Weight (BMXWT):** Body weight was measured in kilograms to the nearest 0.1 kg using a calibrated digital scale. Participants removed shoes, heavy clothing, and items from pockets before measurement.
 
-Accessibility is a combination of five indicators that include how many
-sources a water system has, if the system is reliant on connections to
-other systems, and what types of sources (groundwater, snow, rivers,
-etc.) This score also includes information about droughts and
-overdrafted water basins.
+**Waist Circumference (BMXWAIST):** Waist circumference was measured in centimeters to the nearest 0.1 cm at the iliac crest. Participants stood with feet shoulder-width apart and arms at their sides, with the measurement taken at the end of a normal exhalation.
 
-TMF Capacity risk indicators measure a system’s technical, managerial
-and financial (TMF) capacity to actually maintain a water system long
-term.
+**Gender (RIAGENDR):** Sex was self-reported during the household interview as male or female. For analysis, this was coded as a binary variable (0 = Female, 1 = Male).
 
-This paper looks at how the Total Risk Score varies compared to the
-California Environmental Screening Score for that community. The Total
-Risk Score is calculated based on weighted sub-scores from Water
-Quality, Affordability, Accessibility, and TMF Capacity, (See longer
-definitions in @sec-definitions). The CalEnviroScreen Score is
-calculated based of two sub-scores from Pollution Burden and Population
-Characteristics.
+**Age (RIDAGEYR):** Age in years was collected via household interview and verified with government-issued documents when possible. Age is top-coded at 80 years in NHANES 2017-2018, meaning all participants 80 years and older are recorded as age 80. For this analysis, only participants aged 18-79 were included.
 
-The CalEnviroScreen [@calenviro] is a score created by the State of
-California Office of Environmental Health Hazard Assessment (OEHHA) that
-uses environmental, health, and socioeconomic information to produce
-scores for every census tract in the state. The 20 indicators
-(@sec-calenviroindicator) fall into four sub-categories: Exposures,
-Environmental Effects, Sensitive Populations, and Socioeconomic factors.
-Each indicator is based on current data from a public agency and every
-piece of data has a location where the measurement was taken. A higher
-score is an area that has a higher pollution burden than a lower score.
+**Current Smoking Status (SMQ020, SMQ040):** Smoking status was assessed during the household interview. Participants were first asked if they had smoked at least 100 cigarettes in their lifetime (SMQ020). Those who answered "yes" were then asked if they currently smoke cigarettes every day, some days, or not at all (SMQ040). Current smokers were defined as those who reported smoking either every day or some days (binary: 0 = No, 1 = Yes).
 
-The values used in this paper are based on calculated scores from
-individual indicator values. Each part of the calculation and the data
-collection are subject to uncertainty or subjective analysis. Some of
-the data is from testing in labs, like presence of bacteria or toxins,
-and other data is choices made by people of which indicators to keep or
-exclude in the calculations.
+For each observation, NHANES records comment codes when measurements could not be obtained or when specific conditions affected the measurement. Observations were excluded where comment codes indicated measurement issues or participant refusal.
+
+After applying age restrictions (18-79 years), filtering for data quality based on measurement comment codes, and removing observations with missing values, the final dataset contained 4,610 participants. This sample was randomly split into training (70%), validation (15%), and test (15%) sets for model development and evaluation.
 
 # Methods {#sec-methods}
 
-This paper looks at the results of a simple linear regression model
-shown below.
+This paper analyzes a series of increasingly complex models to evaluate whether BMI alone adequately predicts systolic blood pressure. For most models, $Y_i$ represents the response variable, the average systolic blood pressure (mmHg), for participant $i$.
 
-$$Y_i = \beta_0 +\beta_1 X_i + \varepsilon_i$$
+*Baseline Model:* 
+The starting point is a simple linear regression model with BMI as the only predictor to determine if BMI is a good predictor of systolic blood pressure. This was determined by BMI being used as a screening tool for tests and procedures in healthcare.
 
-$Y_i$ represents the response variable. In this paper the response
-variable is the Total Risk Score.
+Simple linear regression with BMI
+$$Y_i = \beta_0 + \beta_1 X_i + \varepsilon_i$$
+$X_i$ represents the predictor variable, body mass index (kg/m²).
 
-$X_i$ represents the predictor variable. In this paper the predictor
-variable is the CalEnviroScreen Score.
+*Quadratic Model:* 
+Visual inspection of residual plots from the baseline model suggested potential non-linearity as well as prior research [@bmi_alt_adiposity] has indicated that the relationship between BMI and cardiovascular outcomes may not be linear across the entire BMI range.
 
-Both the response and predictor variable are scaled and weighted scores
-based on percentages, so the variables do not have units.
+Polynomial regression with BMI and BMI²
+$$Y_i = \beta_0 + \beta_1 X_i + \beta_2 X_i^2 + \varepsilon_i$$
 
-$\beta_0$ is the y-intercept of the model. For the linear regression
-analysis this would be the expected mean value of the Total Risk Score
-for a small water system with a CalEnviroScreen Score of 0. The
-theoretical range for the CalEnviroScreen Score is 0 to 100, but in a
-practical sense 0 is not a possible score.
+$X_i$ represents BMI and $X_i^2$ represents BMI squared.
 
-$\beta_1$ is the slope of the model. The slope represents how much the
-response variable changes for a unit change in the predictor variable.
-In the regression model the slope would represent how much we would
-expect the mean Total Risk Score to change based on a one unit change
-for the CalEnviroScreen Score.
+*Log Transform Model:* 
+Initial diagnostic plots revealed right-skewed residuals and heteroscedasticity (non-constant variance). A log transformation of the response variable is a standard approach to address these violations of model assumptions.
+
+Use a log function to transform the response variable.
+$$log(Y_i) = \beta_0 + \beta_1 X_i + \varepsilon_i$$
+
+*Huber Loss Robust Regression*
+Q-Q plots revealed the possible presence of influential observations. Robust regression using Huber's loss function provides estimates that are less sensitive to outliers.
+
+$$\rho(u) = \begin{cases}
+\frac{1}{2}u^2 & \text{if } |u| \leq c \\
+c(|u| - \frac{1}{2}c) & \text{if } |u| > c
+\end{cases}$$
+
+where $u$ is the residual and $c = 1.345$ is the default tuning constant used by rlm() function [@venables2002modern].
+
+*Full Model:* 
+To assess whether additional clinically relevant predictors improve upon BMI alone, height, weight, waist circumference, age, gender, and smoking status were included. These variables were selected based on established cardiovascular risk factors, simple and easy to obtain data for future data, and availability in the NHANES data.
+
+Multiple linear regression with all predictors
+$$Y_i = \beta_0 + \beta_1 X_{i1} + \beta_2 X_{i2} + \beta_3 X_{i3} + \beta_4 X_{i4} + \beta_5 X_{i5} + \beta_6 X_{i6} + \beta_7 X_{i7} + \varepsilon_i$$
+
+where the predictors are Height (cm), Weight (kg), BMI (kg/m²), Waist circumference (cm), Gender (binary: 0=Female, 1=Male), Age (years), and Current smoking status (binary: 0=No, 1=Yes).
+
+**Parameter Interpretation**
+
+$\beta_0$ is the y-intercept of the model. For the baseline model, this represents the expected mean systolic blood pressure for an individual with a BMI of 0 kg/m². The intercept does not have a practical interpretation since 0 is not in the range of possible BMI values for any person.  
+
+$\beta_1$ is the slope coefficient. In the baseline model, the slope represents how much systolic blood pressure is expected to change, on average, for a one unit (kg/m²) increase in BMI. In the quadratic model, $\beta_1$ represents the linear effect of BMI while $\beta_2$ captures the quadratic (non-linear) relationship. In the full model, each $\beta_j$ represents the expected change in systolic blood pressure for a one unit increase in predictor $j$, holding all other predictors constant.
 
 $\varepsilon_i$ are the error terms.
 
-This model assumes a linear relationship between Y and X. If the actual
+**Model Assumptions**
+
+The models assume a linear relationship between Y and X. If the actual
 relationship between Y and X is not a linear one, then the model could
 be a bad fit for the data, to the extreme of not being useful at all, or
 possibly just have some bias and predictive values are off.
@@ -180,204 +193,329 @@ The model also assumes that the error terms are independent, have a
 constant variance for all levels of the predictor variable X, the mean
 of the error terms is zero, and the error terms are normally
 distributed. If these assumptions are not true then the values and
-confidence intervals can be misleading. For this data set the sample
+confidence intervals can be misleading. For this dataset the sample
 size is large enough that the normality assumption is less important.
 
-The analysis was done using R programming [@rcode] and built in
+The analysis was done mostly using R programming [@rcode] and built in
 function, lm(), to fit the linear model and calculate estimated slope
 and intercept values. The summary() function takes the fitted model and
 provides a p-value for each of the estimates and a $R^2$ value.
 
-In this analysis, the null hypothesis is that $\beta_1 = 0$ , meaning
-that the slope of the linear regression model is zero, and the
-alternative hypothesis is $\beta_1 \neq 0$. If the null hypothesis is
-true, it would suggest that no linear relationship exists between the
-response and predictor variables. A t test is used to evaluate this
-hypothesis, and if the assumptions above are met, then a p-value less
-than 0.05 would lead to rejecting the null hypothesis. This means that
-there is evidence that supports the idea of a linear relationship
-between the response and predictor variables.
+If the relationship between systolic blood pressure and the predictors is not appropriately captured by the model structure, predictions may be biased. If the error assumptions are violated, standard errors, confidence intervals, and p-values may be misleading. However, with the large sample size, the normality assumption is less critical.
 
-$R^2$, called the coefficient of multiple determination, is the
-proportion of the variance of the response variable that is explained by
-the model. $R^2$ is a value between 0 and 1, and the larger the value of
-$R^2$ the more of the variation of the response variables is explained
-by the model. SSR is the regression sum of squares, and SSTO is the
-total sum of squares.
+**Statistical Analysis**
+
+The analysis was conducted using R programming [@rcode]. Linear models were fit using the `lm()` function, and model summaries including coefficient estimates, standard errors, and p-values were obtained using the `summary()` function.
+
+For each model, we test the null hypothesis $H_0: \beta_j = 0$ against the alternative $H_a: \beta_j \neq 0$ for each predictor. A p-value less than 0.05 provides evidence to reject the null hypothesis, suggesting a statistically significant relationship between the predictor and systolic blood pressure.
+
+**Model Evaluation**
+
+Model performance is evaluated initially using the coefficient of determination, $R^2$, which represents the proportion of variance in systolic blood pressure explained by the model:
 
 $$R^2 = \frac{SSR}{SSTO}$$
 
-# Results {#sec-results}
+where SSR is the regression sum of squares and SSTO is the total sum of squares. $R^2$ ranges from 0 to 1, with higher values indicating better model fit. An adjusted $R^2$ is used to account for the number of predictors in the third model, and root mean squared error (RMSE) on the validation set to assess predictive performance.
 
-```{r fig-calenviron-mhi}
+The cleaned data (n = `r nrow(nhanes_filterNA)`) were randomly split into training (70%), validation (15%), and test (15%) sets. Models were fit on the training data, compared using the validation set, and final performance was evaluated on the test set. The comparison metric was RMSE.  
+
+Root mean squared error (RMSE) was calculated as:
+
+$$RMSE = \sqrt{\frac{1}{n}\sum_{i=1}^{n}(y_i - \hat{y}_i)^2}$$
+
+where $y_i$ is the observed systolic blood pressure, $\hat{y}_i$ is the predicted value, and $n$ is the number of observations in the validation set. RMSE represents the average prediction error in the original units (mmHg), with lower values indicating better predictive accuracy.
+
+# Results {#sec-results}
+The analysis began with a simple linear regression model to evaluate the relationship between just BMI and systolic blood pressure for the NHANES 2017-2018 cycle data. This baseline model was compared to a simple polynomial model. Some studies have suggested that a linear relationship may not be the most appropriate when BMI is a predictor [@bmi_alt_adiposity] so  second model with $BMI^2$ was chosen to see if there would be significant improvement. And the full model includes other predictors including age, sex, gender, current smoking status, and waist circumference to see if it can better capture the variation in systolic blood pressure. All the models were fit with the training dataset, approximately 70% of the total sample.
+
+```{r}
 #| echo: false # not going to print out the code, but will do the plot 
 #| warning: false 
 #| message: false 
-#| fig-cap: "Scatter plot of calenvironscreen versus MHI grouped by risk assessment values"  
 
-# remove any rows with the entry "Missing" or blank cell 
-remove_missing_data <- filter(water_raw_data, !CALENVIRO_SCREEN_SCORE %in% c("Missing",""), !MHI %in% c("Missing",""),  !POPULATION %in% c("Missing",""), !AFFORDABILITY_SCORE %in% c("Missing",""), !ACCESSIBILITY_SCORE %in% c("Missing",""), !AFFORDABILITY_SCORE %in% c("Missing",""), !TMF_CAPACITY_SCORE %in% c("Missing",""), !TOTAL_WEIGHTED_RISK_SCORE_BEFORE_DIVIDING_BY_CATEGORY_COUNT %in% c("Missing",""))  
+# Create train (70%), validation (15%), test (15%) data from original
+set.seed(123)
+n <- nrow(nhanes_filterNA)
 
-# change character columns to numeric 
-remove_missing_data$CALENVIRO_SCREEN_SCORE <- as.numeric(remove_missing_data$CALENVIRO_SCREEN_SCORE) 
-remove_missing_data$MHI <- as.numeric(remove_missing_data$MHI) 
-remove_missing_data$AFFORDABILITY_SCORE <- as.numeric(remove_missing_data$AFFORDABILITY_SCORE) 
-remove_missing_data$WATER_QUALITY_SCORE <- as.numeric(remove_missing_data$WATER_QUALITY_SCORE) 
-remove_missing_data$ACCESSIBILITY_SCORE <- as.numeric(remove_missing_data$ACCESSIBILITY_SCORE) 
-remove_missing_data$TMF_CAPACITY_SCORE <- as.numeric(remove_missing_data$TMF_CAPACITY_SCORE)
-remove_missing_data$TOTAL_WEIGHTED_RISK_SCORE_BEFORE_DIVIDING_BY_CATEGORY_COUNT <- as.numeric(remove_missing_data$TOTAL_WEIGHTED_RISK_SCORE_BEFORE_DIVIDING_BY_CATEGORY_COUNT) 
+nhanes_split <- initial_validation_split(nhanes_filterNA, prop = c(0.7, 0.15)) 
+train_data <- training(nhanes_split)
+validation_data <- validation(nhanes_split)
+test_data <- testing(nhanes_split)
 
-# filter data so has only rows with fewer than 3300 service connections 
-water_data_small_systems <- filter(remove_missing_data, SERVICE_CONNECTIONS < 3300)  
+# Simple Linear Regression, using BMI as the only predictor
+simple_model <- lm(avg_systolic ~ BMXBMI, data = train_data)
+simple_summary <- summary(simple_model)
+
+intercept  <- coef(simple_model)["(Intercept)"]
+slope      <- coef(simple_model)["BMXBMI"]
+r2         <- simple_summary$r.squared
+pval       <- simple_summary$coefficients["BMXBMI", "Pr(>|t|)"]
 ```
 
-After a couple years of funding and some improvements to small water
-systems in California, are there correlations between risk indicator
-scores? This paper will look at how the Total Risk Score varies with
-CalEnviroScreen Score, and if a linear model is a good choice for the
-association. Only smaller water systems with fewer than 3300 service
-connections are included. In @fig-calenviro-totalRisk a scatterplot is
-created showing a possible positive association between Total Risk Score
-and CalEnviroScreen Score. Included in the scatterplot is a linear
-regression line.
+The simple linear regression model with BMI as the predictor has an 
+intercept of `r round(intercept, 3)` representing the predicted systolic blood pressure for an individual with a BMI of zero. As mentioned in the [@sec-methods], this value doesn't have a real medical meaning since no one can have a BMI of zero. The model has a slope of `r round(slope, 3)` which is the expected change in systolic blood pressure in mm Hg associated with a one-unit increase in BMI (kg/m$^2$). 
+The $R^2$ value (R² = `r round(r2, 3)`) suggests that the model explains about `r round(r2 * 100, 1)`% of the variation in systolic 
+blood pressure . And a very small p-value of `r pval` means that there does seem to be a significant relationship between BMI 
+and systolic blood pressure. 
 
-```{r fig-calenviro-totalRisk}
-#| echo: false # not going to print out the code, but will do the plot
-#| warning: false
-#| message: false
-#| fig-cap: "Scatter plot of CalEnvironScreen Score versus Total Risk Score"
+In @fig-simpleBMI a scatterplot of systolic blood pressure versus body mass index is shown for the training data with a linear regression model fit. Visually the data matches the results of the linear regression. There does appear to be a positive association between BMI and SBP, but there is a lot of other variation that is not explained. Most of the data points are between 20 and 40 for BMI, and under 160 mmHg for blood pressure. However there are still a lot of points outside those ranges and very few that could possibly be identified as outliers on their own. 
 
-# scatterplot
-ggplot(data = water_data_small_systems, aes(x = CALENVIRO_SCREEN_SCORE, y = TOTAL_WEIGHTED_RISK_SCORE_BEFORE_DIVIDING_BY_CATEGORY_COUNT)) +
-  geom_point(size = 0.8) + 
-  geom_smooth(se=FALSE) + 
-  ylab("Total Risk Score") + 
-  xlab("CalEnviroScreen Score") +
-  labs(title = "Small Water System Total Risk Score vs CalEnviroScreenScore")
-```
-
-```{r}
-#| echo: false # not going to print out the code, but will do the output
-#| warning: false
-#| message: false
-#| results: hide # should not print out the results
-
-lm_calenviro <- lm(TOTAL_WEIGHTED_RISK_SCORE_BEFORE_DIVIDING_BY_CATEGORY_COUNT ~ CALENVIRO_SCREEN_SCORE, water_data_small_systems)
-lm_calenviro_summary <- summary(lm_calenviro)
-
-max_risk <- max(water_data_small_systems $TOTAL_WEIGHTED_RISK_SCORE_BEFORE_DIVIDING_BY_CATEGORY_COUNT, na.rm = TRUE)
-```
-
-The simple linear regression model for this relationship would have a
-$b_0$ value of `r round(coef(lm_calenviro)[1],3)` and the $b_1$ value of
-`r round(coef(lm_calenviro)[2],4)`. As discussed in the Methods
-@sec-methods, the intercept $b_0$ does not have great interpretation
-because a predictor value of CalEnviroScreen Score equal to zero is not
-a reasonable value for an actual data point. The $b_1$ value represents
-the estimated slope of the linear model and means that for every unit
-increase in the CalEnviroScreen Score for a small water system, the
-Total Risk Score has increased by about
-`r round(coef(lm_calenviro)[2],4)`. The positive slope matches the
-visual on the scatterplot that there is a positive association.
-
-In the model the p-value is small (much smaller than 0.001) for both the
-intercept and slope estimates, indicating there may be some significance
-to the model (see section @methods for p-value and $R^2$). However, the
-large range of values in the data for each predictor level, and the
-smaller $R^2$ value of `r lm_calenviro_summary$r.squared` means that the
-model may not be the best fit for the data because only about 12.7% of
-the variance in the data is explained by the model.
-
-The CalEnviroScreen score is the result of several factors that may
-contribute to pollution in an area and is not explained purely by the
-income level of the local population.
-
-The residual plot @fig-residuals from the linear regression model, plots
-the residuals against the fitted value. If this plot shows random points
-above and below zero with no clear trend then this suggests that the
-model could be a good fit for the data. If the residuals show a trend
-that is curved or something that is not horizontal at y=0, it could
-suggest some of the assumptions in the model are not met.
-
-```{r fig-residuals}
-#| echo: false # not going to print out the code, but will do the plot
-#| warning: false
-#| message: false
-#| fig-cap: "Residual plot of Total Risk Score versus CalEnvironScreen Score"
-
-#plot(lm_calenviro, which = 1,  main = "Residual vs Fitted Values")
-#title(sub = "Total Risk Score vs CalEnviroScreen Score Simple Linear Regression Model")
-
-#plot(lm_calenviro, which = 1,  main = "Residual vs Fitted Values")
-#plot(fitted(lm_calenviro), resid(lm_calenviro), main = "Residual vs Fitted Values", xlab = "Fitted Values", ylab = "Residuals")
-#abline(0,0)
-
-ggplot(data.frame(residuals = residuals(lm_calenviro), fitted = fitted(lm_calenviro)),
-       aes(x = fitted, y = residuals)) +
-  geom_point() + # Scatter plot of residuals
-  geom_hline(yintercept = 0, color = "red", linetype = "dashed") + # Add horizontal line at zero
-  xlab("Fitted Values") +
-  ylab("Residuals") +
-  labs(title = "Residual vs Fitted Values", sub = "Total Risk Score vs CalEnviroScreen Score Simple Linear Regression Model")
-
-```
-
-The residual plot @fig-residuals does not display an obvious visual
-trend in the residuals. This suggesting that the residuals do not have
-their own significant pattern that is not explained by the model. The
-residuals appear to be spread wider above the y=0 line, possibly
-suggesting that it is not a symmetrical distribution. The residuals also
-have a wider range on the right of the plot, fanning out slightly,
-meaning the assumption of constant variance in the error terms is not
-met. The values from the t-test may not be reliable.
-
-```{r fig-qq}
-#| echo: false # not going to print out the code, but will do the plot
-#| warning: false
-#| message: false
-#| fig-cap: "Q-Q plot for Residuals of Total Risk Score versus CalEnvironScreen Score Linear Regression"
-
-ggplot(data = NULL, aes(sample = resid(lm_calenviro))) +
-  stat_qq() +
-  stat_qq_line() +
-  labs(title = "Normal Q-Q Plot of Residuals",
-       x = "Theoretical Quantiles",
-       y = "Sample Quantiles") +
+```{r fig-simpleBMI}
+#| echo: false # not going to print out the code, but will do the plot 
+#| warning: false 
+#| message: false 
+#| fig-cap: "Scatterplot of Systolic Blood Pressure vs BMI" 
+ 
+# Plotting the Simple Linear Regression Model with only BMI
+ggplot(train_data, aes(x = BMXBMI, y = avg_systolic)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  labs(
+    title = "Systolic Blood Pressure vs BMI",
+    x = "BMI (kg/m²)",
+    y = "Average Systolic BP (mmHg)"
+  ) +
   theme_minimal()
 ```
 
-In the Q-Q plot of the residuals @fig-qq the values stray far from the
-y=x line, suggesting that the assumption of normality in the errors is
-not met. However, this analysis has over 2000 data points which limits
-the reliance on the assumption of normality and does not mean the model
-is useless or useful by itself.
+The residual versus fitted plot in @fig-simpleBMIresidual resembles the original scatterplot and might have a non-linear trend appearing as a reflected quadratic. The similarity to the original scatterplot makes sense since not a lot of the variation was explained by the model. The possible non-linear trend in the residuals will be investigated with a quadratic model as the second model in this analysis. The residual plot also shows more clearly that the data does not appear to have a constant variance. Specifically, SRP values above average tend to be more spread out than SRP values below the average.  
+
+```{r fig-simpleBMIresidual}
+#| echo: false # not going to print out the code, but will do the plot 
+#| warning: false 
+#| message: false 
+#| fig-cap: "Residual vs Fitted Values for Simple Linear Regression Baseline Model 1"
+
+# Add residuals and fitted values to training data
+train_data <- train_data %>%
+  mutate(
+    fitted_simple = fitted(simple_model),
+    residuals_simple = residuals(simple_model)
+  )
+
+# Residuals vs Fitted plot
+ggplot(train_data, aes(x = fitted_simple, y = residuals_simple)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  geom_smooth(se = FALSE, color = "blue") +
+  labs(
+    title = "Residual Plot for Simple Model (BMI only)",
+    x = "Fitted Values",
+    y = "Residuals"
+  ) +
+  theme_minimal()
+```
+
+
+```{r fig-simpleQQ}
+#| echo: false # not going to print out the code, but will do the plot 
+#| warning: false 
+#| message: false 
+#| fig-cap: "QQ plot for Normality Check"
+
+# QQ plot for normality check
+ggplot(train_data, aes(sample = residuals_simple)) +
+  stat_qq() +
+  stat_qq_line(color = "red") +
+  labs(title = "Q-Q Plot of Residuals") +
+  theme_minimal()
+```
+```{r}
+#| echo: false # not going to print out the code, but will do the plot 
+#| warning: false 
+#| message: false 
+
+# log transform on response variable SRP
+simple_log_model <- lm(log(avg_systolic) ~ BMXBMI, data = train_data)
+simple_log_summary <- summary(simple_log_model)
+
+intercept_log  <- coef(simple_log_model)["(Intercept)"]
+slope_log      <- coef(simple_log_model)["BMXBMI"]
+r2_log         <- simple_log_summary$r.squared
+pval_log       <- simple_log_summary$coefficients["BMXBMI", "Pr(>|t|)"]
+```
+A QQ plot of the residuals in @fig-simpleQQ shows where some of the model assumptions about normality might not be met. For values near the mean, the assumption the model seems to meet the assumptions of normality. However the tails are both deviating from the y=x line. Two possible ways to investigate. The first is to try a log transform of the response variable, SRP, to see if that will give a better fit with the skewed variance. Another is a robust regression with Huber loss function to try to account for data points far from the mean having a large influence on the model fit.  
+
+The regression model with BMI as the predictor and a log transform of the response variable SRP has an 
+intercept of `r round(intercept_log, 3)` representing the expected log of the systolic blood pressure for an individual with a BMI of zero. This means that the expected systolic blood pressure would be $e^{b_0}$ which is `r round(exp(intercept_log),3)`. The model has a slope of `r round(slope_log, 3)` which is the expected change in the log of systolic blood pressure in mm Hg associated with a one-unit increase in BMI (kg/m$^2$). 
+
+$$log(Y_i) = \beta_0 + \beta_1 X_i + \varepsilon_i$$
+$$E[log(Y_i)] = \beta_0 + \beta_1 X_i$$
+To find how much the systolic blood pressure might change due to an increase in BMI of 1 kg/m$^2$, we would need to substitute $X_i +1$ and solve for Y.
+$$ log(Y_2) = \beta_0 + \beta_1 (X_i+1)$$
+$$ Y_1 = e^{\beta_0 + \beta_1 X_1}$$
+$$ Y_2 = e^{\beta_0 + \beta_1 (X_1 + 1)}$$
+$$ Y_2 = e^{\beta_0 + \beta_1 X_1 } e^{\beta_1}$$
+$$Y_2 = e^{\beta_1} Y_1$$
+So the value estimated by the model for $\beta_1$ of `r round(slope_log, 3)` leads to a multiplicative change in the systolic blood pressure value for a unit change in BMI of `r round(exp(slope_log), 3)`. For an increase of 1 BMI it would be expected that the systolic blood pressure is `r round(exp(slope_log), 3)` times more. 
+
+```{r fig-logBMIresidual}
+#| echo: false # not going to print out the code, but will do the plot 
+#| warning: false 
+#| message: false 
+#| fig-cap: "QQ Plot for Log Regression Baseline Model"
+
+# Add residuals and fitted values to training data
+train_data <- train_data %>%
+  mutate(
+    fitted_log = fitted(simple_log_model),
+    residuals_log = residuals(simple_log_model)
+  )
+
+# # Residuals vs Fitted plot
+# ggplot(train_data, aes(x = fitted_log, y = residuals_log)) +
+#   geom_point(alpha = 0.5) +
+#   geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+#   geom_smooth(se = FALSE, color = "blue") +
+#   labs(
+#     title = "Residual Plot for Log Model (BMI only)",
+#     x = "Fitted Values",
+#     y = "Residuals"
+#   ) +
+#   theme_minimal()
+
+# QQ plot for normality check
+ggplot(train_data, aes(sample = residuals_log)) +
+  stat_qq() +
+  stat_qq_line(color = "red") +
+  labs(title = "Q-Q Plot of Residuals") +
+  theme_minimal()
+```
+In @fig-logBMIresidual a QQ plot shows that there is a change from @fig-simpleQQ that flattens the tails, but some of the deviation from normal still exists and the log model only explains a similar portion of the variance to the baseline model.
+
+```{r fig-logscatter}
+#| echo: false # not going to print out the code, but will do the plot 
+#| warning: false 
+#| message: false 
+#| fig-cap: "Scatterplot for the Log Transform of SRP vs BMI"
+
+# Plotting the Simple Linear Regression Model with only BMI
+# ggplot(train_data, aes(x = BMXBMI, y = log(avg_systolic))) +
+#   geom_point(alpha = 0.5) +
+#   geom_smooth(method = "lm", se = FALSE, color = "blue") +
+#   labs(
+#     title = "Systolic Blood Pressure vs BMI",
+#     x = "BMI (kg/m²)",
+#     y = "Log of Average Systolic BP (mmHg)"
+#   ) +
+#   theme_minimal()
+```
+
+
+```{r}
+#| echo: false # not going to print out the code, but will do the plot 
+#| warning: false 
+#| message: false 
+
+#Huber loss function
+huber_model <- rlm(avg_systolic ~ BMXBMI, data = train_data, psi = psi.huber)
+huber_summary <- summary(huber_model)
+
+intercept_huber  <- coef(huber_model)["(Intercept)"]
+slope_huber      <- coef(huber_model)["BMXBMI"]
+```
+
+The regression model with BMI as the predictor and a robust regression using the Huber loss function with a tuning parameter of $c = 1.345$ has an intercept of `r round(intercept_huber, 3)` representing the expected systolic blood pressure for an individual with a BMI of zero. The model has a slope of `r round(slope_huber,3)` which is the expected change systolic blood pressure in mm Hg associated with a one-unit increase in BMI (kg/m$^2$).
+
+```{r}
+#| echo: false # not going to print out the code, but will do the plot 
+#| warning: false 
+#| message: false 
+
+bmi_squared_model <- lm(avg_systolic ~ BMXBMI + I(BMXBMI^2), data = train_data)
+bmi_squared_summary <- summary(bmi_squared_model)
+
+intercept_bmi_squared  <- coef(bmi_squared_model)["(Intercept)"]
+slope_bmi_      <- coef(bmi_squared_model)["BMXBMI"]
+slope_bmi_squared      <- coef(bmi_squared_model)["I(BMXBMI^2)"]
+r2_bmi_squared         <- bmi_squared_summary$r.squared
+```
+
+The regression model with $BMI^2$ as an added predictor has an 
+intercept of `r round(intercept_bmi_squared, 3)` representing the predicted systolic blood pressure for an individual with a BMI of zero. The model has an estimated value for $\beta_1$ of `r round(slope_bmi_, 3)` which is the slope when BMI is zero, and an estimated value for $\beta_2$ of `r round(slope_bmi_squared,3)`.
+The $R^2$ value (R² = `r round(r2_bmi_squared, 3)`) suggests that the model explains about `r round(r2_bmi_squared * 100, 1)`% of the variation in systolic 
+blood pressure. The negative coefficient for the term with a degree of 2 matches the residual trend seen in the baseline model. However, the model does not explain much more of the variance than the baseline model.
+
+```{r}
+#| echo: false # not going to print out the code, but will do the plot 
+#| warning: false 
+#| message: false 
+
+#Full model with all predictors
+full_model <- lm(avg_systolic ~ BMXHT + BMXWT + BMXBMI + BMXWAIST + 
+                   RIAGENDR + RIDAGEYR + currently_smokes, 
+                 data = train_data)
+full_summary <- summary(full_model)
+```
+
+The full linear regression model suggests that age is highly significant, height, weight, and gender are significant, currently smoking is borderline significant, and BMI and waist circumference are not significant. The full model explains about `r round(summary(full_model)$adj.r.squared*100, 3)`% of the variation in average systolic blood pressure. Holding all other predictors constant, age seemed to be the strongest predictor, with an estimated coefficient of `r round(coef(full_model)["RIDAGEYR"], 3)` mmHg for every additional year in age (p = `r summary(full_model)$coefficients["RIDAGEYR", 4]`). Gender was also statistically significant, with males having `r round(coef(full_model)["RIAGENDR"], 3)` mmHg higher systolic blood pressure on average (p = `r summary(full_model)$coefficients["RIAGENDR", 4]`). Height and weight showed small but statistically significant associations, with coefficients of `r round(coef(full_model)["BMXHT"], 3)` (p = `r summary(full_model)$coefficients["BMXHT", 4]`) and `r round(coef(full_model)["BMXWT"], 3)` (p = `r summary(full_model)$coefficients["BMXWT", 4]`), respectively. BMI (`r round(coef(full_model)["BMXBMI"], 3)`, p = `r summary(full_model)$coefficients["BMXBMI", 4]`) and waist circumference (`r round(coef(full_model)["BMXWAIST"], 3)`, p = `r summary(full_model)$coefficients["BMXWAIST", 4]`) were not statistically significant. Smoking status had a marginal association, contributing `r round(coef(full_model)["currently_smokes"], 3)` mmHg on average (p = `r summary(full_model)$coefficients["currently_smokes", 4]`).  
+
+The models that have been fitted to the training data are the simple linear regression baseline model with BMI as the only predictor, a log transform of response variable for the baseline model, a robust regression using a Huber loss function, a quadratic model with BMI only, and a full model. For comparison, only the baseline, the quadratic, and the full model will be used. The log transform and the Huber loss did not have a large enough change in the fit to justify the added complexity in the model. 
+
+The models will be compared by using the root mean squared error as defined in [@sec-methods]. As shown below in the table, the full model has the smallest RMSE, so it is the chosen model. 
+
+```{r}
+#| echo: false # not going to print out the code, but will do the plot 
+#| warning: false 
+#| message: false 
+
+# Predict on validation data
+pred_simple <- predict(simple_model, newdata = validation_data)
+pred_squared <- predict(bmi_squared_model, newdata = validation_data)
+pred_full <- predict(full_model, newdata = validation_data)
+
+# function to calculate RMSE for each model
+rmse <- function(actual, predicted) {
+  sqrt(mean((actual - predicted)^2, na.rm = TRUE))
+}
+
+# Model comparison metrics - use the vectors directly
+comparison <- data.frame(
+  Model = c("Simple (BMI)", "BMI Squared", "Full Model"),
+  RMSE = c(
+    rmse(validation_data$avg_systolic, pred_simple),
+    rmse(validation_data$avg_systolic, pred_squared),
+    rmse(validation_data$avg_systolic, pred_full)
+  )
+)
+
+print(comparison)
+```
+
+
+
+```{r}
+#| echo: false # not going to print out the code, but will do the plot 
+#| warning: false 
+#| message: false 
+# Using the test data
+
+# Predict on test data (use best model from validation)
+pred_final <- predict(full_model, newdata = test_data)
+
+# Test set performance
+test_rmse <- rmse(test_data$avg_systolic, pred_final)
+```
+The final RMSE value using the full model and predicting values using the test data is `r test_rmse`.
 
 # Discussion {#sec-discussion}
 
-part to the overlap in the information
-in the calculations of the score.
+This analysis evaluated whether BMI alone adequately predicts systolic blood pressure using NHANES 2017-2018 data, and whether multivariate models substantially improve prediction. The results demonstrate that while BMI shows a statistically significant positive association with systolic blood pressure, it explains only 3% of the variance when used as a sole predictor. BMI alone is insufficient for predicting individual level systolic blood pressure, despite being useful as a population level screening tool. In addition, the residual plots revealed non constant variance and problems with normality, suggesting that other factors probably also influence blood pressure variation. Adding a quadratic BMI term provided minimal improvement and it didn't seem to improve in predictive accuracy.
 
+The full multivariate model improved predictive performance and explained about 23.5% of systolic blood pressure variance. Age seemed to be the strongest predictor and males showed 2.47 mmHg higher systolic blood pressure than females on average. Once height, weight, and waist circumference were included in the model, BMI became non-significant. This might be due in part by some multicollinearity because BMI is calculated directly from height and weight. When other predictors were held constant, systolic blood pressure increased with weight and decreased with height. This is consistent with the calculation for BMI. 
 
+These results confirm that BMI should not be used by itself to assess cardiovascular risk at the individual level. A prediction error of approximately 19 mmHg from the baseline model RMSE is a large value. That value would put a person into a different level of hypertension because the difference between 'elevated' and 'stage 1 hypertension' is 10 mmHg.  
+
+Even the full multivariate model with seven predictors has only moderate predictive accuracy. This indicates the model is missing important predictors for systolic blood pressure. Possibilities include diet, physical activity, stress, medications, and other health conditions. For the strongest predictor, age, the model suggests that between ages 40 and 70, a person could expect approximately 15 mmHg higher systolic blood pressure, holding other factors constant.
+
+Several limitations should be considered when interpreting these results. First, the analysis restricts the ages to adults between 18-79. This is because the data is top-coded at 80 years in NHANES 2017-2018 for privacy and security reasons. However, this means the findings should not be generalized to those 80 and older. This analysis cannot determine whether these associations seen in the results are causal or just correlated. The models assume linear relationships between predictors and systolic blood pressure. While the analysis tested a quadratic BMI term, other non-linear relationships or interactions between predictors may exist that were not explored. Finally, the residual plots showed some observations have larger prediction errors than expected under normality. We explored log transformation and robust regression using Huber loss, but neither provided substantial improvement. A more flexible model may be appropriate.
+
+This analysis should further explore predictors such as diet, physical activity and known family history of high blood pressure. It could further explore the possible multicollinearity of height, weight, and BMI, as well as other associated factors like waist measurement. This analysis purposely chose to use easier to obtain values for the predictors, but to truly understand what affects blood pressure, using predictors that show fat versus lean muscle quantities in the body, and how much abdominal fat is present, would probably help explain more of the variance in the data.
+
+Another type of analysis would be to try and figure out if there is a time delay between predictors like BMI and developing a condition. If certain health indicators actually do cause conditions or noncontagious disease, then to actually analyze the results appropriately we would need to factor in the delay from the onset of the health indicator to the condition being present.
+
+In conclusion, these findings reinforce that BMI is best suited as a population-level screening tool rather than a diagnostic criterion for individual cardiovascular risk assessment.
 \newpage
-
-# Appendix A DEFINITIONS {#sec-definitions}
-
-*Affordability Threshold* means the level, point, or value that
-delineates if a water system’s residential customer charges, designed to
-ensure the water systems can provide drinking water that meets State and
-Federal standards, are unaffordable. For the purposes of the 2021
-Affordability Assessment, the State Water Board employed affordability
-thresholds for the following indicators: Percent Median Household
-Income; Extreme Water Bill; and Percent Shut-Offs. Learn more about
-current and future indicators and affordability thresholds in Appendix
-E.
-
-
-
-\newpage
-
-# Appendix B THRESHOLD VALUES {#sec-thresholds}
-
 
 
 # References
